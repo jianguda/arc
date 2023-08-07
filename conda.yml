@@ -1,0 +1,22 @@
+name: arc
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - cudnn=8.8
+  - cudatoolkit=11.8
+#  - nomkl=3.0  # for AMD
+  - mkl=2023.1  # for Intel
+  - pip=22.3
+  - python=3.11
+  - pip:
+      - -r requirements.txt
+
+# [ADD]
+# conda env create -f conda.yml
+# [CHECK]
+# conda env list
+# [REMOVE]
+# conda env remove --name arc
+# [UPDATE]
+# conda env update --name arc --file conda.yml --prune
