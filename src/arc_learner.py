@@ -1,5 +1,3 @@
-from collections import defaultdict
-
 from einops import rearrange
 import torch
 import torch.nn.functional as F
@@ -148,12 +146,13 @@ class Refiner(nn.Module):
 
 
 class Learner(LightningModule):
-    def __init__(self, model, attrs, dim_size, cluster_num, identifier):
+    def __init__(self, model, attrs, cluster_num, dim_size, vocab_size, identifier):
         super().__init__()
         self.model = model
         self.attrs = attrs
         self.class_num = cluster_num
         self.refiner = Refiner(dim=dim_size)
+        self.vocab_size = vocab_size
         self.identifier = identifier
 
         # loss
@@ -191,63 +190,49 @@ class Learner(LightningModule):
         return matrix
 
     def compute_anchor_embed(self, matrix, token_label):
-        # embeddings_matrix
-        embeddings_matrix = get_attr(self.model, self.attrs['embedding'])
-        embeddings_matrix = embeddings_matrix.weight
-
         # one-hot tensor
-        vocab_size = embeddings_matrix.shape[0]
-        # print(f'{vocab_size=}')
         # print(f'{embeddings_matrix.shape=}')
-        one_hot_tensor = torch.zeros([1, vocab_size], device=DEVICE)
+        one_hot_tensor = torch.zeros([1, self.vocab_size])
         one_hot_tensor[:, token_label] = 1.0
         # label_tensor = torch.tensor([token_label], dtype=torch.int64).to(device=DEVICE)
         # one_hot_tensor = torch.zeros(len(label_tensor), vocab_size, device=DEVICE)
         # one_hot_tensor = one_hot_tensor.scatter_(1, label_tensor.unsqueeze(1), 1.)
         # one_hot_tensor = torch.zeros(len(label_tensor), vocab_size, device=DEVICE) + 0.5 / self.class_num
         # one_hot_tensor = one_hot_tensor.scatter_(1, label_tensor.unsqueeze(1), 0.5 + 0.5 / self.class_num)
-        one_hot_tensor = one_hot_tensor.clone().requires_grad_(True)
-        # print(f'{one_hot_tensor.shape=}')
-        heuristic_dist = one_hot_tensor
+        heuristic_dist = one_hot_tensor.to(DEVICE)  #.requires_grad_(True)
         heuristic_repr = torch.matmul(heuristic_dist, matrix)
         heuristic_repr = heuristic_repr.flatten()
         return heuristic_repr
 
     def adapt_anchors(self, anchors):
-        ada_anchors = self.refiner.inverse(anchors)
+        ada_anchors = self.refiner.to(DEVICE).inverse(anchors)
         return ada_anchors
 
-    def init_anchors(self, embeds=None, labels=None):
-        if embeds is None or labels is None:
-            self.anchors = Parameter(self.init_abs_anchors())
-        else:
-            self.anchors = Parameter(self.init_rel_anchors(embeds, labels))
-
-    def init_abs_anchors(self):
+    def init_abs_anchors(self, vocab_labels):
         matrix = self.build_virtual_matrix()
 
         anchors = list()
+        self.vocab_label2id = dict()
         # absolute_anchor
-        for label in range(self.class_num):
-            anchor = self.compute_anchor_embed(matrix, label)
+        for label_id, vocab_label in enumerate(vocab_labels):
+            anchor = self.compute_anchor_embed(matrix, vocab_label)
             anchors.append(anchor)
-        anchors = torch.stack(anchors, dim=0)
-        return anchors
+            self.vocab_label2id[vocab_label] = label_id
+        self.anchors = torch.stack(anchors, dim=0).to(DEVICE)
 
-    def init_rel_anchors(self, embeds, labels):
-        anchors = list()
-        # relative_anchor
-        embeds_by_label = defaultdict(list)
-        for embed, label in zip(embeds, labels):
-            embeds_by_label[label].append(embed)
-        for _label, _embeds in embeds_by_label.items():
-            # logger.warning(f'{_embeds=}')
-            _embeds = torch.cat(_embeds, dim=0)
-            _anchor = torch.mean(_embeds, dim=0)
-            # logger.critical(f'{_anchor=}')
-            anchors.append(_anchor)
-        anchors = torch.stack(anchors, dim=0)
-        return anchors
+    # def init_rel_anchors(self, embeds, labels):
+    #     anchors = list()
+    #     # relative_anchor
+    #     embeds_by_label = defaultdict(list)
+    #     for embed, label in zip(embeds, labels):
+    #         embeds_by_label[label].append(embed)
+    #     for _label, _embeds in embeds_by_label.items():
+    #         # logger.warning(f'{_embeds=}')
+    #         _embeds = torch.cat(_embeds, dim=0)
+    #         _anchor = torch.mean(_embeds, dim=0)
+    #         # logger.critical(f'{_anchor=}')
+    #         anchors.append(_anchor)
+    #     self.anchors = torch.stack(anchors, dim=0).to(DEVICE)
 
     def forward(self, embeds: Tensor) -> tuple[Tensor, Tensor]:
         # dists = list()
@@ -272,7 +257,12 @@ class Learner(LightningModule):
     def compute_loss(self, embeds, embeds_z, embeds_hat, labels):
         simis = self.simi_fn(embeds_z, self.anchors)
         logits = nn.functional.softmax(simis, dim=-1).to(DEVICE)
-        truths = labels.to(DEVICE)
+
+        # truths = labels.to(DEVICE)
+        labels = labels.cpu().tolist()
+        label_ids = torch.tensor([self.vocab_label2id[label] for label in labels])
+        truths = label_ids.to(DEVICE)
+
         clustering_loss = self.criterion1(logits, truths)
         reconstruct_loss = self.criterion2(embeds_hat, embeds)
         loss = clustering_loss + reconstruct_loss

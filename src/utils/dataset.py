@@ -11,6 +11,7 @@ from torch.utils.data import Dataset, Sampler
 
 
 def get_max_demo_shot(dataset='sst2'):
+    # max context length = 1024
     # array1=(mpqa) # maxshot = 32
     # array2=(sst2) # maxshot = 16
     # array3=(subj cr mr trec) # maxshot = 8

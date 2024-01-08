@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from arc_learner import CoupleDataset, Learner
 from arc_load import NeoLoader, Metric, _load_stackoverflow
-from arc_shared import DEVICE, CACHE_OUTS_DIR, CFG_ANCHOR_INIT, VISUAL_OUTS_DIR, DRYRUN_SAMPLE_NUM, CFG_MODE_DRYRUN, \
+from arc_shared import DEVICE, CACHE_OUTS_DIR, VISUAL_OUTS_DIR, DRYRUN_SAMPLE_NUM, CFG_MODE_DRYRUN, \
     CFG_MODE_VERBOSE, CFG_MODE_INSPECT
 from arc_util import stylize, format_score, get_attr, inspect
 from utils.dataset import load_dataset, get_max_demo_shot
@@ -30,8 +30,10 @@ class Pipeline:
         # dim_size
         if 'gpt2' in cfg.MODEL_NAME:
             dim_size = self.model.config.n_embd
+            self.vocab_size = self.model.config.vocab_size
         elif 'pythia' in cfg.MODEL_NAME:
             dim_size = self.model.config.hidden_size
+            self.vocab_size = self.model.config.vocab_size
         else:
             raise NotImplementedError
 
@@ -51,7 +53,10 @@ class Pipeline:
 
         # ...
         self.learner = Learner(
-            model=self.model, attrs=self.attrs, dim_size=dim_size, cluster_num=cluster_num, identifier=self.identifier)
+            model=self.model, attrs=self.attrs,
+            cluster_num=cluster_num, dim_size=dim_size, vocab_size=self.vocab_size,
+            identifier=self.identifier
+        )
 
         # we freeze all parameters to save computation
         for name, parameter in self.model.named_parameters():
@@ -63,22 +68,26 @@ class Pipeline:
 
         filename = f'{self.identifier}.pkl'
 
-        # load data
-        if (folder / filename).is_file():
-            with open(folder / filename, 'rb') as handle:
-                train_embeds, train_labels, test_embeds, test_labels = pickle.load(handle)
-            return train_embeds, train_labels, test_embeds, test_labels
-
         if self.cfg.DATA_CODE == 'stackoverflow':
+            # prepare dataset
             _, train_labels, train_comments = _load_stackoverflow('train')
             _, test_labels, test_comments = _load_stackoverflow('test')
             # label2id
             train_labels = [int(label) - 1 for label in train_labels]
             test_labels = [int(label) - 1 for label in test_labels]
+
+            # vocab_labels
+            self.vocab_labels = list(range(20))
         else:
             # prepare dataset
             train_data, dev_data = load_dataset(dataset=self.cfg.DATA_CODE)
             n_demo_shot = get_max_demo_shot(dataset=self.cfg.DATA_CODE)
+
+            # vocab_labels
+            self.vocab_labels = list()
+            for idx, label_verb in enumerate(train_data.id2verb):
+                label = self.tokenizer.encode(' ' + label_verb)[-1]
+                self.vocab_labels.append(label)
 
             # TODO shall we try with few-shot demos???
             # train
@@ -88,7 +97,8 @@ class Pipeline:
             for ins in train_data.data:
                 comment = make_prompt(ins, self.cfg.DATA_CODE, mode='inference')
                 train_comments.append(comment)
-                label = label2id[ins['label']]
+                label_id = label2id[ins['label']]
+                label = self.vocab_labels[label_id]
                 train_labels.append(label)
 
             train_data.subsamplebyshot(n_demo_shot)
@@ -101,8 +111,15 @@ class Pipeline:
             for ins in dev_data.data:
                 comment = prompt_prefix + make_prompt(ins, self.cfg.DATA_CODE, mode='inference')
                 test_comments.append(comment)
-                label = label2id[ins['label']]
+                label_id = label2id[ins['label']]
+                label = self.vocab_labels[label_id]
                 test_labels.append(label)
+
+        # load data_cache
+        if (folder / filename).is_file():
+            with open(folder / filename, 'rb') as handle:
+                train_embeds, test_embeds = pickle.load(handle)
+            return train_embeds, train_labels, test_embeds, test_labels
 
         # em (we do like this one since it is intuitive and cheap)
         train_embeds = self.compose_data(train_comments)
@@ -113,7 +130,7 @@ class Pipeline:
         # dump data
         folder.mkdir(parents=True, exist_ok=True)
         with open(folder / filename, 'wb') as handle:
-            data = (train_embeds, train_labels, test_embeds, test_labels)
+            data = (train_embeds, test_embeds)
             pickle.dump(data, handle)
 
         return train_embeds, train_labels, test_embeds, test_labels
@@ -206,7 +223,7 @@ class Pipeline:
             embeds_list.append(layer_embed)
         return embeds_list
 
-    def logits_to_output(self, logits, watch_labels=None):
+    def logits_to_output(self, logits):
         # pred = torch.argmax(logits).tolist()
         sorted_probs, sorted_labels = logits.sort(dim=-1, descending=True)
         argmax_probs = sorted_probs.cpu().numpy()[0].tolist()
@@ -231,18 +248,6 @@ class Pipeline:
         #             argmax_vocab_labels.append(argmax_label)
         #     argmax_probs = argmax_vocab_probs
         #     argmax_labels = argmax_vocab_labels
-
-        # watch_probs = []
-        # watch_rankings = []
-        # if watch_labels is not None:
-        #     for watch_label in watch_labels:
-        #         # watch_token = self.tokenizer.decode(watch_label)
-        #         # logger.critical(f'{watch_label=}, {watch_token=}')
-        #         # logger.critical(f'{torch.tensor(argmax_labels) == watch_label=}')
-        #         ranking = torch.nonzero(torch.tensor(argmax_labels) == watch_label).flatten()
-        #         prob = argmax_probs[ranking]
-        #         watch_probs.append(prob)
-        #         watch_rankings.append(int(ranking))
 
         # we only care about top tokens
         # argmax_probs = argmax_probs[:MAX_FOCUSING_NUM]
@@ -276,7 +281,6 @@ class Pipeline:
         # train_embeds = np.ascontiguousarray(embedding)
 
         # Y -= (np.max(Y, axis=0) + np.min(Y, axis=0)) / 2
-
 
         initialization = "median"
         k = 25
@@ -338,10 +342,8 @@ class Pipeline:
         # test_loader = DataLoader(dataset, sampler=test_sampler, batch_size=1)
 
         # xxx
-        if CFG_ANCHOR_INIT == 'abs':
-            self.learner.init_anchors()
-        if CFG_ANCHOR_INIT == 'rel':
-            self.learner.init_anchors(train_embeds, train_labels)
+        self.learner.init_abs_anchors(self.vocab_labels)
+        # self.learner.init_rel_anchors(train_embeds, train_labels)
 
         train_embeds = torch.cat(train_embeds, 0)
         # logger.debug(f'{train_embeds.shape=}')
@@ -416,9 +418,9 @@ class Pipeline:
         # logger.debug(f'{test_embeds.shape=}')
         # logger.debug(f'{test_refined_embeds.shape=}')
 
-        # baseline GEN
-        self.report_gen(test_embeds, test_refined_embeds, test_labels)
         if CFG_MODE_VERBOSE:
+            # baseline GEN
+            self.report_gen(test_embeds, test_refined_embeds, test_labels)
             # baseline RAG
             self.report_rag(train_embeds, train_refined_embeds, train_labels, test_embeds, test_refined_embeds, test_labels)
 
@@ -461,7 +463,7 @@ class Pipeline:
     # 2. retrieval-aug (RAG)
     # 3. knn-prompting (KP-RAG)
     # 4. vocab-anchors (VA-GEN, VA-RAG)
-    def infer(self, matrix, embeds):
+    def infer(self, embeds, matrix):
         argmax_labels = list()
         # argmax_tokens = list()
         for embed in embeds:
@@ -470,6 +472,7 @@ class Pipeline:
             logits = logits.unsqueeze(0)
             # logger.warning(f'{logits.shape=}')
             argmax_prob, argmax_label = self.logits_to_output(logits)
+            # argmax_label = torch.argmax(logits)
             argmax_labels.append(argmax_label)
         return argmax_labels
 
@@ -479,10 +482,10 @@ class Pipeline:
         for embed in embeds:
             # embed -> logit -> label
             simis = self.learner.simi_fn(embed, anchors)
+            # logger.info(f'{simis=}')
             logits = nn.functional.softmax(simis, dim=-1).to(DEVICE)
             logits = logits.detach().unsqueeze(0)
-            # logger.warning(f'{logits.shape=}')
-            argmax_prob, argmax_label = self.logits_to_output(logits)
+            argmax_label = self.vocab_labels[torch.argmax(logits)]
             argmax_labels.append(argmax_label)
         return argmax_labels
 
@@ -537,14 +540,14 @@ class Pipeline:
         gen_labels = self.refer(anchors.to(DEVICE), origin_embeds.to(DEVICE))
         arc_labels = self.refer(anchors.to(DEVICE), reform_embeds.to(DEVICE))
         Metric.contrast_gen_scoring(gen_labels, arc_labels, refer_labels)
-        # dependent on the REFER practice
+        # # dependent on the REFER practice
         Metric.contrast_cluster_measuring(gen_labels, arc_labels, refer_labels)
 
         # ...
         ada_anchors = self.learner.adapt_anchors(anchors)
         ada_labels = self.refer(ada_anchors.to(DEVICE), origin_embeds.to(DEVICE))
         Metric.contrast_gen_scoring(gen_labels, ada_labels, refer_labels)
-        # dependent on the REFER practice
+        # # dependent on the REFER practice
         Metric.contrast_cluster_measuring(gen_labels, ada_labels, refer_labels)
 
         # dump generalizations
@@ -555,8 +558,8 @@ class Pipeline:
     def report_gen(self, origin_embeds, reform_embeds, refer_labels):
         # ...
         matrix = self.learner.build_actual_matrix()
-        gen_labels = self.infer(matrix, origin_embeds)
-        arc_labels = self.infer(matrix, reform_embeds)
+        gen_labels = self.infer(origin_embeds, matrix)
+        arc_labels = self.infer(reform_embeds, matrix)
         Metric.contrast_gen_scoring(gen_labels, arc_labels, refer_labels)
 
     def report_rag(

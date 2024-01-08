@@ -26,10 +26,10 @@ def main():
 #   3. clustering, RAG
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data', default='sst2', type=str, help='[stackoverflow] sst2 ...')
-    parser.add_argument('--model', default='pythia-xs', type=str, help='[pythia-xs] gpt2 ...')
+    parser.add_argument('--data', default='trec', type=str, help='[stackoverflow] sst2 trec ...')
+    parser.add_argument('--model', default='gpt2', type=str, help='[pythia-xs] gpt2 ...')
     parser.add_argument('--exp', default='standard.approach', type=str, help='[standard.approach] ...')
-    parser.add_argument('--epoch-num', default='100', type=int, help='[1] 100 ...')
+    parser.add_argument('--epoch-num', default='500', type=int, help='[1] 100 ...')
     parser.add_argument('--batch-size', default='1024', type=int, help='[1024] 2048 512 ...')
     args = parser.parse_args()
 
